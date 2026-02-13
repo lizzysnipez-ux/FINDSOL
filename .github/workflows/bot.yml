@@ -1,0 +1,26 @@
+name: Telegram Bot Webhook
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [telegram-update]
+
+jobs:
+  handle-webhook:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run bot handler
+        env:
+          BOT_TOKEN: \${{ secrets.BOT_TOKEN }}
+        run: python -c "import os, json, sys
+from bot import run_webhook
+event = json.loads(os.environ.get('GITHUB_EVENT', '{}'))
+context = {}
+run_webhook(event, context)"
