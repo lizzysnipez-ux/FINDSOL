@@ -14,6 +14,15 @@ from solders.pubkey import Pubkey
 import base58
 from datetime import datetime
 
+# Try to import nacl for key conversion
+try:
+    import nacl.signing
+    import nacl.encoding
+    HAS_NACL = True
+except ImportError:
+    HAS_NACL = False
+    print("WARNING: pynacl not installed, private keys will not be compatible with Phantom!", file=sys.stderr)
+
 # ==================== STARTUP ERROR HANDLING ====================
 try:
     # ==================== CONFIGURATION ====================
@@ -54,15 +63,45 @@ try:
 
     # ==================== HELPER FUNCTIONS ====================
     def format_private_key(private_key_bytes):
-        """Format private key correctly for Phantom (64 bytes -> Base58)"""
-        # The private key should be 64 bytes total
-        base58_key = base58.b58encode(private_key_bytes).decode()
-        json_array = list(private_key_bytes)
+        """
+        Format private key as Ed25519 keypair for Phantom (64 bytes)
         
-        # Log the length for debugging
-        logger.info(f"Private key generated: {len(base58_key)} chars, {len(private_key_bytes)} bytes")
-        
-        return {'base58': base58_key, 'json_array': json_array}
+        bip_utils gives us 32 bytes (seed), but Phantom needs the full 64-byte keypair:
+        - First 32 bytes: private key seed
+        - Last 32 bytes: public key
+        """
+        try:
+            if HAS_NACL and len(private_key_bytes) == 32:
+                # Convert 32-byte seed to Ed25519 signing key
+                signing_key = nacl.signing.SigningKey(private_key_bytes)
+                
+                # Get the full keypair (64 bytes)
+                # signing_key.encode() = 32 bytes private key seed
+                # signing_key.verify_key.encode() = 32 bytes public key
+                keypair_bytes = signing_key.encode() + signing_key.verify_key.encode()
+                
+                # Encode to Base58
+                base58_key = base58.b58encode(keypair_bytes).decode()
+                json_array = list(keypair_bytes)
+                
+                logger.info(f"✅ Generated valid keypair: {len(base58_key)} chars (should be 87-88)")
+                
+                return {
+                    'base58': base58_key,
+                    'json_array': json_array,
+                    'seed': base58.b58encode(private_key_bytes).decode()  # Keep seed for debugging
+                }
+            else:
+                # Fallback to raw seed format (44 chars) - not Phantom compatible!
+                logger.warning(f"Using raw seed format ({len(private_key_bytes)} bytes) - NOT Phantom compatible!")
+                base58_key = base58.b58encode(private_key_bytes).decode()
+                json_array = list(private_key_bytes)
+                return {'base58': base58_key, 'json_array': json_array}
+        except Exception as e:
+            logger.error(f"Key conversion error: {e}")
+            base58_key = base58.b58encode(private_key_bytes).decode()
+            json_array = list(private_key_bytes)
+            return {'base58': base58_key, 'json_array': json_array}
 
     def get_token_symbol(mint_address):
         """Get token symbol from mint address"""
@@ -177,7 +216,7 @@ try:
                     tasks = []
                     for wallet in batch:
                         tasks.append(asyncio.gather(
-                            check_sol_balance(session, wallet['address'], RPC_ENDPOINTS[0]),  # Use first endpoint for speed
+                            check_sol_balance(session, wallet['address'], RPC_ENDPOINTS[0]),
                             check_spl_tokens(session, wallet['address'], RPC_ENDPOINTS[0])
                         ))
                     
@@ -194,6 +233,9 @@ try:
                             found_count += 1
                             reported_wallets.add(wallet['index'])
                             
+                            key_length = len(wallet['private_key']['base58'])
+                            key_valid = "✅" if key_length > 80 else "❌"
+                            
                             message = f"🎉 *WALLET WITH FUNDS FOUND!*\n\n"
                             message += f"📌 *Account Index:* `{wallet['index']}`\n"
                             message += f"📬 *Address:* `{wallet['address']}`\n"
@@ -204,9 +246,17 @@ try:
                                 for token in spl_tokens:
                                     message += f"• *{token['symbol']}*: `{token['balance']}`\n"
                             
-                            message += f"\n🔐 *BASE58 PRIVATE KEY (length: {len(wallet['private_key']['base58'])} chars):*\n"
+                            message += f"\n🔐 *BASE58 PRIVATE KEY (length: {key_length} chars) {key_valid}:*\n"
                             message += f"`{wallet['private_key']['base58']}`\n\n"
-                            message += f"*✅ Copy this entire key and import in Phantom → Add Account → Import Private Key*"
+                            
+                            if key_length > 80:
+                                message += f"*✅ This key is valid for Phantom! Import instructions:*\n"
+                            else:
+                                message += f"*❌ This key is too short! pynacl may not be installed.*\n"
+                            
+                            message += f"1. Copy the ENTIRE key above\n"
+                            message += f"2. Open Phantom → Add Account → Import Private Key\n"
+                            message += f"3. Paste and click Import"
                             
                             await context.bot.send_message(
                                 chat_id=update.effective_chat.id,
@@ -248,15 +298,19 @@ try:
         """Handle /start command"""
         user = update.effective_user
         logger.info(f"Start command from user {user.id}")
+        
+        nacl_status = "✅ Installed" if HAS_NACL else "❌ NOT INSTALLED - Keys will NOT work in Phantom!"
+        
         await update.message.reply_text(
             "👋 *Welcome to Solana Wallet Finder!*\n\n"
             "• Scans 100 wallets\n"
             "• Checks SOL + ALL SPL tokens\n"
             "• Parallel scanning for speed\n\n"
+            f"*🔐 Key Format Status:* {nacl_status}\n\n"
             "/scan - Start scanning\n"
             "/cancel - Cancel\n\n"
             "*📥 IMPORT INSTRUCTIONS:*\n"
-            "1. Copy the Base58 private key (should be ~87-88 chars)\n"
+            "1. Copy the ENTIRE Base58 private key\n"
             "2. Open Phantom → Add Account → Import Private Key\n"
             "3. Paste the key and click Import",
             parse_mode='Markdown'
@@ -267,9 +321,12 @@ try:
         chat_id = update.effective_chat.id
         user_states[chat_id] = {'awaiting_seed': True}
         logger.info(f"Scan command from chat {chat_id}")
+        
+        nacl_warning = "" if HAS_NACL else "\n\n⚠️ *Warning:* pynacl not installed - private keys will NOT work in Phantom!"
+        
         await update.message.reply_text(
             f"📝 *Send your 12-word seed phrase:*\n\n"
-            f"I'll scan {MAX_WALLETS} wallets for SOL + all SPL tokens.",
+            f"I'll scan {MAX_WALLETS} wallets for SOL + all SPL tokens.{nacl_warning}",
             parse_mode='Markdown'
         )
 
@@ -350,6 +407,7 @@ try:
         logger.info("🚀 Starting Solana Wallet Finder Bot...")
         logger.info(f"📊 Scanning {MAX_WALLETS} wallets")
         logger.info(f"🤖 Bot token exists: {bool(BOT_TOKEN)}")
+        logger.info(f"🔐 pynacl installed: {HAS_NACL} - {'✅ Keys will work in Phantom' if HAS_NACL else '❌ Keys will NOT work in Phantom!'}")
         
         if not BOT_TOKEN:
             logger.error("❌ BOT_TOKEN not set!")
