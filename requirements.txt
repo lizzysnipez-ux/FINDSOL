@@ -3,7 +3,6 @@ bip-utils==2.9.3
 solana==0.33.0
 solders==0.21.0
 base58==2.1.1
-requests==2.31.0
-flask==3.1.2
-gunicorn
 aiohttp==3.9.1
+Flask==3.1.2
+gunicorn
