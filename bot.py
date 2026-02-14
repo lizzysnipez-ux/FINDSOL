@@ -319,7 +319,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Clear user state
         del user_states[chat_id]
 
-# ==================== WEBHOOK HANDLERS ====================
+# ==================== ADD HANDLERS ====================
+telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(CommandHandler("scan", scan))
+telegram_app.add_handler(CommandHandler("cancel", cancel))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+# ==================== WEBHOOK PROCESSING ====================
+async def process_update(update_data):
+    """Process Telegram update asynchronously"""
+    try:
+        # Initialize the application if not already initialized
+        if not telegram_app._initialized:
+            logger.info("Initializing telegram application...")
+            await telegram_app.initialize()
+            logger.info("Application initialized successfully")
+        
+        update = Update.de_json(update_data, telegram_app.bot)
+        await telegram_app.process_update(update)
+    except Exception as e:
+        logger.error(f"Error processing update: {e}")
+
 @flask_app.route('/webhook', methods=['POST'])
 def webhook():
     """Handle incoming Telegram updates"""
@@ -341,33 +361,25 @@ def health():
     """Health check endpoint for Render"""
     return 'Bot is running!', 200
 
-async def process_update(update_data):
-    """Process Telegram update asynchronously"""
+# ==================== SETUP FUNCTION ====================
+async def init_and_setup():
+    """Initialize application and set webhook"""
     try:
-        update = Update.de_json(update_data, telegram_app.bot)
-        await telegram_app.process_update(update)
-    except Exception as e:
-        logger.error(f"Error processing update: {e}")
-
-# ==================== ADD HANDLERS ====================
-telegram_app.add_handler(CommandHandler("start", start))
-telegram_app.add_handler(CommandHandler("scan", scan))
-telegram_app.add_handler(CommandHandler("cancel", cancel))
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-# ==================== SETUP WEBHOOK ====================
-async def setup_webhook():
-    """Set the webhook on startup"""
-    if RENDER_URL:
-        webhook_url = f"{RENDER_URL}/webhook"
-        try:
-            # Delete any existing webhook first
+        # Initialize the application
+        await telegram_app.initialize()
+        logger.info("✅ Application initialized")
+        
+        # Set webhook if URL is configured
+        if RENDER_URL:
+            webhook_url = f"{RENDER_URL}/webhook"
             await telegram_app.bot.delete_webhook()
-            # Set new webhook
-            await telegram_app.bot.set_webhook(url=webhook_url)
-            logger.info(f"✅ Webhook set to {webhook_url}")
-        except Exception as e:
-            logger.error(f"❌ Failed to set webhook: {e}")
+            success = await telegram_app.bot.set_webhook(url=webhook_url)
+            if success:
+                logger.info(f"✅ Webhook set to {webhook_url}")
+            else:
+                logger.error("❌ Failed to set webhook")
+    except Exception as e:
+        logger.error(f"❌ Setup error: {e}")
 
 # ==================== MAIN ====================
 if __name__ == "__main__":
@@ -377,8 +389,8 @@ if __name__ == "__main__":
     logger.info(f"🪙 Tracking {len(TOKEN_SYMBOLS)} known SPL tokens")
     logger.info(f"🤖 Bot token exists: {bool(BOT_TOKEN)}")
     
-    # Set webhook asynchronously
-    asyncio.run(setup_webhook())
+    # Initialize the application and set webhook
+    asyncio.run(init_and_setup())
     
     # Run Flask app
     flask_app.run(host='0.0.0.0', port=PORT)
