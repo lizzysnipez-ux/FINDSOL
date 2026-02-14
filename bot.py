@@ -3,22 +3,21 @@ import json
 import asyncio
 import logging
 import sys
-import time
-import random
 import aiohttp
+from flask import Flask, request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from bip_utils import Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
-from solana.rpc.api import Client
 from solders.pubkey import Pubkey
 import base58
 from datetime import datetime
-from flask import Flask
-import threading
 
 # ==================== CONFIGURATION ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MAX_WALLETS = 100
+PORT = int(os.environ.get('PORT', 10000))
+# Your Render URL - set this in Render environment variables
+RENDER_URL = os.environ.get('RENDER_EXTERNAL_URL', '')
 
 # Multiple RPC endpoints for load balancing
 RPC_ENDPOINTS = [
@@ -26,7 +25,6 @@ RPC_ENDPOINTS = [
     "https://solana-api.projectserum.com",
     "https://rpc.ankr.com/solana",
     "https://solana.publicnode.com",
-    "https://api.mainnet.rpcpool.com",
 ]
 
 # ==================== SETUP LOGGING ====================
@@ -36,22 +34,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== FLASK HEALTH CHECK ====================
-health_app = Flask(__name__)
-
-@health_app.route('/')
-@health_app.route('/health')
-def health():
-    return 'Bot is running!'
-
-def run_health_server():
-    health_app.run(host='0.0.0.0', port=10000)
-
-# Start health server in background thread
-threading.Thread(target=run_health_server, daemon=True).start()
+# ==================== FLASK APP FOR WEBHOOK ====================
+flask_app = Flask(__name__)
 
 # ==================== TELEGRAM BOT SETUP ====================
-application = Application.builder().token(BOT_TOKEN).build()
+# Important: No updater for webhook mode!
+telegram_app = Application.builder().token(BOT_TOKEN).updater(None).build()
 user_states = {}
 
 # ==================== HELPER FUNCTIONS ====================
@@ -77,15 +65,9 @@ async def check_balance_async(session, address, endpoint, retry_count=0):
                 if 'result' in data:
                     return data['result']['value'] / 1e9
             elif response.status == 429 and retry_count < 2:
-                # Rate limited - wait and retry with different endpoint
                 await asyncio.sleep(1)
                 new_endpoint = RPC_ENDPOINTS[(RPC_ENDPOINTS.index(endpoint) + 1) % len(RPC_ENDPOINTS)]
                 return await check_balance_async(session, address, new_endpoint, retry_count + 1)
-    except asyncio.TimeoutError:
-        if retry_count < 2:
-            await asyncio.sleep(0.5)
-            new_endpoint = RPC_ENDPOINTS[(RPC_ENDPOINTS.index(endpoint) + 1) % len(RPC_ENDPOINTS)]
-            return await check_balance_async(session, address, new_endpoint, retry_count + 1)
     except Exception as e:
         logger.debug(f"Balance check error for {address}: {e}")
     
@@ -96,7 +78,6 @@ async def scan_wallets_parallel(seed_phrase, update):
     try:
         seed = Bip39SeedGenerator(seed_phrase).Generate()
         
-        # Step 1: Derive all addresses first (this is very fast)
         await update.message.reply_text("🔑 Deriving wallet addresses...")
         
         wallets = []
@@ -115,28 +96,23 @@ async def scan_wallets_parallel(seed_phrase, update):
                 'private_key': private_key
             })
         
-        await update.message.reply_text(f"🔍 Scanning {MAX_WALLETS} wallets with 10 parallel connections...")
+        await update.message.reply_text(f"🔍 Scanning {MAX_WALLETS} wallets with parallel connections...")
         
-        # Step 2: Scan in parallel batches
         found_count = 0
-        batch_size = 20  # Scan 20 wallets at a time
+        batch_size = 20
         
         async with aiohttp.ClientSession() as session:
             for batch_start in range(0, MAX_WALLETS, batch_size):
                 batch_end = min(batch_start + batch_size, MAX_WALLETS)
                 batch = wallets[batch_start:batch_end]
                 
-                # Create tasks for this batch
                 tasks = []
                 for wallet in batch:
-                    # Distribute requests across different endpoints
                     endpoint = RPC_ENDPOINTS[wallet['index'] % len(RPC_ENDPOINTS)]
                     tasks.append(check_balance_async(session, wallet['address'], endpoint))
                 
-                # Run all balance checks in parallel
                 balances = await asyncio.gather(*tasks)
                 
-                # Process results
                 batch_found = 0
                 for wallet, balance in zip(batch, balances):
                     if balance and balance > 0:
@@ -144,17 +120,25 @@ async def scan_wallets_parallel(seed_phrase, update):
                         batch_found += 1
                         logger.info(f"Found wallet {wallet['index']} with {balance} SOL")
                         
-                        # Send wallet details
+                        # ===== FIXED PRIVATE KEY FORMAT =====
+                        # Get the complete Base58 key (no truncation)
+                        base58_key = wallet['private_key']['base58']
+                        
+                        # Send wallet found message with clear import instructions
                         await update.message.reply_text(
                             f"🎉 *WALLET WITH FUNDS FOUND!*\n\n"
                             f"📌 *Account Index:* `{wallet['index']}`\n"
                             f"📬 *Address:* `{wallet['address']}`\n"
-                            f"💰 *Balance:* `{balance} SOL`\n\n"
-                            f"🔐 *Private Key (JSON):*\n"
-                            f"`{wallet['private_key']['json_array']}`\n\n"
-                            f"🔐 *Private Key (Base58):*\n"
-                            f"`{wallet['private_key']['base58']}`\n\n"
-                            f"⚠️ *SAVE THIS AND DELETE THIS MESSAGE*",
+                            f"💰 *Balance:* `{balance:.6f} SOL`\n\n"
+                            f"*📥 HOW TO IMPORT INTO PHANTOM:*\n"
+                            f"1. Copy the Base58 key below (the whole long string)\n"
+                            f"2. Open Phantom → Click profile icon → Add Account\n"
+                            f"3. Select *Import Private Key* (NOT Recovery Phrase)\n"
+                            f"4. Paste the key and click Import\n\n"
+                            f"🔐 *BASE58 PRIVATE KEY (USE THIS FOR PHANTOM):*\n"
+                            f"`{base58_key}`\n\n"
+                            f"*(Alternative format - JSON array, if needed)*\n"
+                            f"`{wallet['private_key']['json_array']}`",
                             parse_mode='Markdown'
                         )
                 
@@ -180,10 +164,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Commands:*\n"
         "/scan - Start scanning for wallets\n"
         "/cancel - Cancel current operation\n\n"
-        "⚡ *Features:*\n"
-        f"• Scans {MAX_WALLETS} wallets in ~15 seconds\n"
-        "• Parallel scanning for maximum speed\n"
-        "• Multiple RPC endpoints to avoid rate limits\n\n"
+        "*📥 HOW TO IMPORT FOUND WALLETS:*\n"
+        "When a wallet is found, copy the Base58 private key and:\n"
+        "1. Open Phantom wallet\n"
+        "2. Click profile icon → Add Account\n"
+        "3. Select *Import Private Key* (NOT Recovery Phrase)\n"
+        "4. Paste the key and click Import\n\n"
         "⚠️ *Security:* Your seed phrase is only used temporarily.",
         parse_mode='Markdown'
     )
@@ -195,7 +181,8 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Scan command from chat {chat_id}")
     await update.message.reply_text(
         f"📝 *Please send your 12 or 24-word seed phrase:*\n\n"
-        f"I'll scan the first {MAX_WALLETS} wallets at high speed.",
+        f"I'll scan the first {MAX_WALLETS} wallets at high speed.\n\n"
+        f"⚠️ *Important:* Make sure to copy the full Base58 key when wallets are found!",
         parse_mode='Markdown'
     )
 
@@ -220,6 +207,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         try:
             # Start timing
+            import time
             start_time = time.time()
             
             # Run the parallel scan
@@ -233,7 +221,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• Wallets scanned: {MAX_WALLETS}\n"
                 f"• Wallets with funds: {found_count}\n"
                 f"• Time taken: {elapsed_time:.1f} seconds\n\n"
-                f"Use /scan to try another seed phrase.",
+                f"*Remember:* Use the Base58 private key to import into Phantom!",
                 parse_mode='Markdown'
             )
             logger.info(f"Scan complete for chat {chat_id}, found {found_count} wallets in {elapsed_time:.1f}s")
@@ -246,18 +234,62 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Clear user state
         del user_states[chat_id]
 
+# ==================== WEBHOOK HANDLERS ====================
+@flask_app.route('/webhook', methods=['POST'])
+def webhook():
+    """Handle incoming Telegram updates"""
+    try:
+        update_data = request.get_json()
+        logger.info(f"Received webhook update: {update_data.get('update_id')}")
+        
+        # Process the update asynchronously
+        asyncio.run(process_update(update_data))
+        
+        return 'OK', 200
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return 'OK', 200
+
+@flask_app.route('/health')
+@flask_app.route('/')
+def health():
+    """Health check endpoint for Render"""
+    return 'Bot is running!', 200
+
+async def process_update(update_data):
+    """Process Telegram update asynchronously"""
+    try:
+        update = Update.de_json(update_data, telegram_app.bot)
+        await telegram_app.process_update(update)
+    except Exception as e:
+        logger.error(f"Error processing update: {e}")
+
 # ==================== ADD HANDLERS ====================
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("scan", scan))
-application.add_handler(CommandHandler("cancel", cancel))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(CommandHandler("scan", scan))
+telegram_app.add_handler(CommandHandler("cancel", cancel))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+# ==================== SETUP WEBHOOK ====================
+async def setup_webhook():
+    """Set the webhook on startup"""
+    if RENDER_URL:
+        webhook_url = f"{RENDER_URL}/webhook"
+        try:
+            await telegram_app.bot.set_webhook(url=webhook_url)
+            logger.info(f"Webhook set to {webhook_url}")
+        except Exception as e:
+            logger.error(f"Failed to set webhook: {e}")
 
 # ==================== MAIN ====================
 if __name__ == "__main__":
-    print("🚀 Starting Solana Wallet Finder Bot...")
-    print(f"📊 Will scan {MAX_WALLETS} wallets per request")
-    print(f"🌐 Using {len(RPC_ENDPOINTS)} RPC endpoints for load balancing")
-    print(f"🤖 Bot token exists: {bool(BOT_TOKEN)}")
+    logger.info("🚀 Starting Solana Wallet Finder Bot with webhook...")
+    logger.info(f"📊 Will scan {MAX_WALLETS} wallets per request")
+    logger.info(f"🌐 Using {len(RPC_ENDPOINTS)} RPC endpoints for load balancing")
+    logger.info(f"🤖 Bot token exists: {bool(BOT_TOKEN)}")
     
-    # Start the bot
-    application.run_polling()
+    # Set webhook asynchronously
+    asyncio.run(setup_webhook())
+    
+    # Run Flask app (this blocks)
+    flask_app.run(host='0.0.0.0', port=PORT)
