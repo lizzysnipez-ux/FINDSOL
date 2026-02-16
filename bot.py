@@ -9,7 +9,7 @@ import aiohttp
 from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from bip_utils import Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes, Bip39MnemonicValidator, Bip39MnemonicError
+from bip_utils import Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes, Bip39MnemonicValidator
 from solders.pubkey import Pubkey
 import base58
 from datetime import datetime
@@ -81,18 +81,8 @@ try:
             if validator.IsValid(cleaned):
                 return True, "Valid seed phrase"
             else:
-                # Try to get more specific error
-                try:
-                    # This will throw a more specific error
-                    Bip39SeedGenerator(cleaned).Generate()
-                    return True, "Valid seed phrase"
-                except Bip39MnemonicError as e:
-                    return False, str(e)
-                except Exception as e:
-                    return False, f"Invalid checksum"
+                return False, "Invalid checksum - please verify the phrase is correct"
                     
-        except Bip39MnemonicError as e:
-            return False, str(e)
         except Exception as e:
             return False, f"Invalid seed phrase: {str(e)}"
 
@@ -441,11 +431,6 @@ try:
                 
                 logger.info(f"Scan complete for chat {chat_id}, found {found_count} wallets in {elapsed_time:.1f}s")
                 
-            except Bip39MnemonicError as e:
-                logger.error(f"Seed phrase error: {e}")
-                await update.message.reply_text(
-                    f"❌ Invalid seed phrase: {str(e)}\n\nPlease check and try again."
-                )
             except Exception as e:
                 logger.error(f"Scan error: {e}")
                 await update.message.reply_text(f"❌ Error: {str(e)}")
