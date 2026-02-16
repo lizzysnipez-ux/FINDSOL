@@ -9,7 +9,7 @@ import aiohttp
 from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from bip_utils import Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
+from bip_utils import Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes, Bip39MnemonicValidator, Bip39MnemonicError
 from solders.pubkey import Pubkey
 import base58
 from datetime import datetime
@@ -62,6 +62,40 @@ try:
     user_states = {}
 
     # ==================== HELPER FUNCTIONS ====================
+    def validate_seed_phrase(seed_phrase):
+        """
+        Validate a BIP39 seed phrase
+        Returns (is_valid, error_message)
+        """
+        try:
+            # Clean the phrase
+            cleaned = ' '.join(seed_phrase.strip().split())
+            words = cleaned.split()
+            
+            # Check word count
+            if len(words) not in [12, 15, 18, 21, 24]:
+                return False, f"Invalid word count: {len(words)}. Expected 12, 15, 18, 21, or 24 words."
+            
+            # Validate the mnemonic
+            validator = Bip39MnemonicValidator()
+            if validator.IsValid(cleaned):
+                return True, "Valid seed phrase"
+            else:
+                # Try to get more specific error
+                try:
+                    # This will throw a more specific error
+                    Bip39SeedGenerator(cleaned).Generate()
+                    return True, "Valid seed phrase"
+                except Bip39MnemonicError as e:
+                    return False, str(e)
+                except Exception as e:
+                    return False, f"Invalid checksum"
+                    
+        except Bip39MnemonicError as e:
+            return False, str(e)
+        except Exception as e:
+            return False, f"Invalid seed phrase: {str(e)}"
+
     def format_private_key(private_key_bytes):
         """
         Format private key as Ed25519 keypair for Phantom (64 bytes)
@@ -107,66 +141,97 @@ try:
         """Get token symbol from mint address"""
         return TOKEN_SYMBOLS.get(mint_address, mint_address[:8] + "...")
 
-    async def check_sol_balance(session, address, endpoint):
-        """Check SOL balance for an address"""
-        try:
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getBalance",
-                "params": [address]
-            }
+    async def check_sol_balance(session, address, endpoints, retries=2):
+        """Check SOL balance for an address with retry logic and multiple endpoints"""
+        for attempt in range(retries):
+            # Try different endpoints in round-robin fashion
+            for endpoint in endpoints:
+                try:
+                    payload = {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "getBalance",
+                        "params": [address]
+                    }
+                    
+                    async with session.post(endpoint, json=payload, timeout=10) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            if 'result' in data:
+                                return data['result']['value'] / 1e9
+                            elif 'error' in data:
+                                logger.debug(f"RPC error from {endpoint}: {data['error']}")
+                        elif response.status == 429:  # Rate limited
+                            logger.debug(f"Rate limited by {endpoint}, trying next...")
+                            await asyncio.sleep(1)
+                            continue
+                except asyncio.TimeoutError:
+                    logger.debug(f"Timeout from {endpoint}")
+                    continue
+                except Exception as e:
+                    logger.debug(f"Error from {endpoint}: {e}")
+                    continue
             
-            async with session.post(endpoint, json=payload, timeout=5) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if 'result' in data:
-                        return data['result']['value'] / 1e9
-        except Exception as e:
-            logger.debug(f"SOL balance check error for {address}: {e}")
+            # If we've tried all endpoints and still failed, wait before retry
+            if attempt < retries - 1:
+                await asyncio.sleep(2)
+        
         return 0
 
-    async def check_spl_tokens(session, address, endpoint):
-        """Check all SPL tokens for an address"""
-        try:
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getTokenAccountsByOwner",
-                "params": [
-                    address,
-                    {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
-                    {"encoding": "jsonParsed"}
-                ]
-            }
+    async def check_spl_tokens(session, address, endpoints, retries=2):
+        """Check SPL tokens with retry logic and multiple endpoints"""
+        for attempt in range(retries):
+            for endpoint in endpoints:
+                try:
+                    payload = {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "getTokenAccountsByOwner",
+                        "params": [
+                            address,
+                            {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+                            {"encoding": "jsonParsed"}
+                        ]
+                    }
+                    
+                    async with session.post(endpoint, json=payload, timeout=15) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            tokens = []
+                            
+                            if 'result' in data and 'value' in data['result']:
+                                for account in data['result']['value']:
+                                    try:
+                                        parsed = account['account']['data']['parsed']
+                                        if parsed['program'] == 'spl-token' and parsed['type'] == 'account':
+                                            info = parsed['info']
+                                            token_amount = info['tokenAmount']
+                                            balance = float(token_amount['uiAmount'])
+                                            
+                                            if balance > 0:
+                                                mint = info['mint']
+                                                tokens.append({
+                                                    'mint': mint,
+                                                    'balance': balance,
+                                                    'symbol': get_token_symbol(mint),
+                                                })
+                                    except Exception:
+                                        continue
+                            
+                            return tokens
+                        elif response.status == 429:
+                            logger.debug(f"Rate limited by {endpoint}, trying next...")
+                            await asyncio.sleep(1)
+                            continue
+                except asyncio.TimeoutError:
+                    logger.debug(f"Timeout from {endpoint}")
+                    continue
+                except Exception:
+                    continue
             
-            async with session.post(endpoint, json=payload, timeout=8) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    tokens = []
-                    
-                    if 'result' in data and 'value' in data['result']:
-                        for account in data['result']['value']:
-                            try:
-                                parsed = account['account']['data']['parsed']
-                                if parsed['program'] == 'spl-token' and parsed['type'] == 'account':
-                                    info = parsed['info']
-                                    token_amount = info['tokenAmount']
-                                    balance = float(token_amount['uiAmount'])
-                                    
-                                    if balance > 0:
-                                        mint = info['mint']
-                                        tokens.append({
-                                            'mint': mint,
-                                            'balance': balance,
-                                            'symbol': get_token_symbol(mint),
-                                        })
-                            except Exception:
-                                continue
-                    
-                    return tokens
-        except Exception:
-            return []
+            if attempt < retries - 1:
+                await asyncio.sleep(2)
+        
         return []
 
     async def scan_wallets_parallel(seed_phrase, update, context):
@@ -216,8 +281,8 @@ try:
                     tasks = []
                     for wallet in batch:
                         tasks.append(asyncio.gather(
-                            check_sol_balance(session, wallet['address'], RPC_ENDPOINTS[0]),
-                            check_spl_tokens(session, wallet['address'], RPC_ENDPOINTS[0])
+                            check_sol_balance(session, wallet['address'], RPC_ENDPOINTS),
+                            check_spl_tokens(session, wallet['address'], RPC_ENDPOINTS)
                         ))
                     
                     results = await asyncio.gather(*tasks)
@@ -305,7 +370,8 @@ try:
             "👋 *Welcome to Solana Wallet Finder!*\n\n"
             "• Scans 100 wallets\n"
             "• Checks SOL + ALL SPL tokens\n"
-            "• Parallel scanning for speed\n\n"
+            "• Parallel scanning for speed\n"
+            "• Validates seed phrases before scanning\n\n"
             f"*🔐 Key Format Status:* {nacl_status}\n\n"
             "/scan - Start scanning\n"
             "/cancel - Cancel\n\n"
@@ -347,6 +413,25 @@ try:
         
         if chat_id in user_states and user_states[chat_id].get('awaiting_seed'):
             logger.info(f"Received seed phrase from chat {chat_id}")
+            
+            # Validate the seed phrase first
+            is_valid, error_msg = validate_seed_phrase(message)
+            
+            if not is_valid:
+                await update.message.reply_text(
+                    f"❌ *Invalid seed phrase:* {error_msg}\n\n"
+                    f"Please check the phrase and try again.\n"
+                    f"Common issues:\n"
+                    f"• Misspelled words\n"
+                    f"• Wrong word order\n"
+                    f"• Missing words\n"
+                    f"• Extra spaces\n\n"
+                    f"Use /cancel to stop",
+                    parse_mode='Markdown'
+                )
+                # Don't clear state - let them try again
+                return
+            
             await update.message.reply_text("✅ Starting scan...")
             
             try:
@@ -356,6 +441,11 @@ try:
                 
                 logger.info(f"Scan complete for chat {chat_id}, found {found_count} wallets in {elapsed_time:.1f}s")
                 
+            except Bip39MnemonicError as e:
+                logger.error(f"Seed phrase error: {e}")
+                await update.message.reply_text(
+                    f"❌ Invalid seed phrase: {str(e)}\n\nPlease check and try again."
+                )
             except Exception as e:
                 logger.error(f"Scan error: {e}")
                 await update.message.reply_text(f"❌ Error: {str(e)}")
